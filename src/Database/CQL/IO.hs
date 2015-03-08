@@ -67,7 +67,6 @@ module Database.CQL.IO
     , ClientState
     , DebugInfo   (..)
     , QueryLike
-    , PreparedStatement
     , init
     , runClient
     , retry
@@ -84,7 +83,11 @@ module Database.CQL.IO
     , emptyPage
     , paginate
 
+      -- ** Prepared statements
+    , PreparedStatement
     , prepare
+    , preparedQuery
+    , preparedQueryId
 
       -- ** low-level
     , request
@@ -150,6 +153,14 @@ instance QueryLike PreparedStatement where
 
 -- | A 'prepare'd query.
 data PreparedStatement k a b = PS (QueryString k a b) (IORef (QueryId k a b))
+
+-- | Returns the query string used to create this prepared statement
+preparedQuery :: PreparedStatement k a b -> QueryString k a b
+preparedQuery (PS q _) = q
+
+-- | Returns the current 'QueryId' associated with this prepared statment.
+preparedQueryId :: (MonadClient m) => PreparedStatement k a b -> m (QueryId k a b)
+preparedQueryId (PS _ qRef) = liftIO $ readIORef qRef
 
 instance Show (PreparedStatement k a b) where
   showsPrec d (PS (QueryString s) _) r =
