@@ -26,6 +26,7 @@
 --
 
 {-# LANGUAGE DeriveFunctor #-}
+{-# LANGUAGE GADTs #-}
 
 module Database.CQL.IO
     ( -- * Client settings
@@ -78,6 +79,11 @@ module Database.CQL.IO
     , write
     , schema
     , batch
+
+    , BatchWrite (..)
+    , OneBatchWrite (..)
+    , batchWrite
+    , batchWrite1
 
     , Page      (..)
     , emptyPage
@@ -136,10 +142,14 @@ class QueryLike q where
     -- | Re-prepares a prepared statement after receiving an 'Unprepared' exception,
     -- if applicable.  Re-throws the 'Error' otherwise.
     fixupStalePreparedStatement :: (MonadClient m, Tuple a, Tuple b) => q k a b -> Error -> m ()
+    -- | Produces a list of 'BatchQuery's representing this single query applied to a
+    -- collection of 'Tuple's
+    toBatch :: (MonadClient m, Show a, Tuple a, Tuple b) => q W a b -> [a] -> m [BatchQuery]
 
 instance QueryLike QueryString where
     toRequest q p = return $ RqQuery (Query q p)
     fixupStalePreparedStatement _ e = throwM e
+    toBatch q as = return $ map (BatchQuery q) as
 
 instance QueryLike PreparedStatement where
     toRequest (PS _ qRef) p = liftIO $ do
@@ -150,6 +160,9 @@ instance QueryLike PreparedStatement where
         case res of
             RsResult _ (PreparedResult qid _ _) -> liftIO $ atomicWriteIORef qRef qid
             _                                   -> throwM UnexpectedResponse
+    toBatch (PS _ qRef) as = liftIO $ do
+       q <- readIORef qRef
+       return $ map (BatchPrepared q) as
 
 -- | A 'prepare'd query.
 data PreparedStatement k a b = PS (QueryString k a b) (IORef (QueryId k a b))
@@ -211,8 +224,59 @@ schema x y = do
         _                                 -> throwM UnexpectedResponse
 
 -- | Run a batch query against a Cassandra node.
-batch :: MonadClient m => Batch -> m ()
+batch :: MonadClient m => Batch -> m () -- should this be moved to the low-level doc section?
 batch b = command (RqBatch b)
+
+-- | The subset of 'Batch' which applies to all queries within a batch.
+data BatchWrite = BatchWrite
+    { batchWriteType :: BatchType
+    , batchWriteConsistency :: Consistency
+    , batchWriteSerialConsistency :: Maybe SerialConsistency
+    }
+
+-- | A subset of a 'batchWrite' which represents a collection of tuples being paired
+-- with a single query.
+data OneBatchWrite where
+    OneBatchWrite :: (QueryLike q, Tuple a, Show a) => q W a () -> [a] -> OneBatchWrite
+
+-- | Provideds a convenient way to execute batches of writes, both those which
+-- write to multiple tables, and those which write multiple rows to a single table.
+batchWrite :: (MonadClient m) => BatchWrite -> [OneBatchWrite] -> m ()
+batchWrite b qRs = (plainBatch >>= batch) `catch` handleUnprepared
+    where plainBatch = do
+              qb <- concat <$> mapM batchQueries qRs
+              return Batch { batchType = batchWriteType b
+                           , batchConsistency = batchWriteConsistency b
+                           , batchSerialConsistency = batchWriteSerialConsistency b
+                           , batchQuery = qb
+                           }
+
+          batchQueries (OneBatchWrite q as) = toBatch q as
+
+          handleUnprepared e@(Unprepared _ _) = do
+              -- ok, so at least one of the prepared statements got
+              -- forgotten by the server, but we have no idea which.
+              -- We don't even know that all the queries ARE prepared
+              -- statements!  So we'll reprepare them all.  Anything
+              -- that wasn't a prepared statement will re-throw the
+              -- Unprepared error that we give it, so we can just
+              -- ignore those.  In use-cases where there are any
+              -- prepared statements at all, there shouldn't be many
+              -- total distinct queries (and in any event servers
+              -- forgetting prepared statements should be very rare).
+              mapM_ (reprepare e) qRs
+              batchWrite b qRs
+          handleUnprepared other = throwM other
+
+          reprepare e (OneBatchWrite q _) =
+              fixupStalePreparedStatement q e `catch` ignoreUnprepared
+
+          ignoreUnprepared (Unprepared _ _) = return ()
+          ignoreUnprepared other = throwM other
+
+-- | Apply a single write query to a batch of rows.
+batchWrite1 :: (MonadClient m, Tuple a, Show a, QueryLike q) => BatchWrite -> q W a () -> [a] -> m ()
+batchWrite1 b q rs = batchWrite b [OneBatchWrite q rs]
 
 -- | Return value of 'paginate'. Contains the actual result values as well
 -- as an indication of whether there is more data available and the actual
